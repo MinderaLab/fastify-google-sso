@@ -84,6 +84,7 @@ since this is for a human in a browser, not a script.
 | `sessionSecret` | yes | — | Signs the session cookie. `openssl rand -hex 32`. Rotating it logs everyone out. |
 | `isAllowed` | yes | — | `(profile) => boolean \| Promise<boolean>`. Authorization, not authentication — see below. |
 | `basePath` | no | `/auth/google` | Where this plugin's own routes live. |
+| `externalBasePath` | no | same as `basePath` | Set this if you're behind a reverse proxy that strips a path prefix before forwarding here — see below. |
 | `cookieName` | no | `google_sso_session` | |
 | `sessionTtlSeconds` | no | `43200` (12h) | |
 | `successRedirect` | no | `/` | Where the browser lands after a successful login. |
@@ -115,3 +116,27 @@ need named individuals outside that domain too.
   out for now to avoid the open-redirect footgun of doing it carelessly.
 - **`@fastify/oauth2` handles CSRF protection** on the OAuth flow itself
   (the `state`/PKCE dance) — nothing extra needed from you there.
+
+## Behind a reverse proxy that strips a path prefix
+
+If this app is reached through something like Tailscale Serve's
+`--set-path=/sitemap` — the proxy strips `/sitemap` before forwarding, so
+the app itself only ever sees and registers un-prefixed paths — set
+`externalBasePath` to the full external prefix:
+
+```ts
+await app.register(googleSso, {
+  // ...
+  basePath: "/auth/google",              // unprefixed — what this app actually receives
+  externalBasePath: "/sitemap/auth/google", // what the browser actually needs in the URL
+  successRedirect: "/sitemap/admin/dashboard",
+});
+```
+
+Without this, `requireGoogleSession`'s "please log in" redirect sends the
+browser to `/auth/google/login` — resolved by the browser against the
+external origin, missing the proxy's prefix — which 404s against the proxy
+layer itself, never reaching this app. `callbackUri` still needs to be the
+*full* external URL (scheme + host + prefixed path, exactly matching what's
+registered in Google Cloud Console) — `externalBasePath` is path-only, since
+a `Location` header is always resolved relative to the current origin.

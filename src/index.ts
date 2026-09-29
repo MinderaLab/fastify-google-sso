@@ -46,6 +46,20 @@ export interface GoogleSsoOptions {
   isAllowed: (profile: GoogleSsoProfile) => boolean | Promise<boolean>;
   /** Base path for this plugin's own routes (login/callback/logout). Default "/auth/google". */
   basePath?: string;
+  /**
+   * What to put in a browser-facing redirect Location header instead of
+   * basePath, when they need to differ. Only matters behind a reverse proxy
+   * that strips a path prefix before forwarding to this app (e.g. Tailscale
+   * Serve's --set-path) — the app itself still only ever sees and registers
+   * routes at the un-prefixed basePath (that's what actually arrives), but a
+   * redirect Location header is resolved by the *browser* against the
+   * external, still-prefixed URL, so it needs the full external prefix or it
+   * 404s against the proxy layer instead of reaching this app. E.g. basePath
+   * "/auth/google" + externalBasePath "/sitemap/auth/google" when this app
+   * is reachable externally as https://host/sitemap/... Defaults to basePath
+   * (no proxy prefix — the common case).
+   */
+  externalBasePath?: string;
   /** Session cookie name. Default "google_sso_session". */
   cookieName?: string;
   /** Session lifetime in seconds. Default 43200 (12 hours). */
@@ -107,6 +121,7 @@ function unsign(signedValue: string, secret: string): string | null {
 
 async function googleSsoPlugin(fastify: FastifyInstance, opts: GoogleSsoOptions): Promise<void> {
   const basePath = opts.basePath ?? DEFAULT_BASE_PATH;
+  const externalBasePath = opts.externalBasePath ?? basePath;
   const cookieName = opts.cookieName ?? DEFAULT_COOKIE_NAME;
   const ttlSeconds = opts.sessionTtlSeconds ?? DEFAULT_TTL_SECONDS;
   const successRedirect = opts.successRedirect ?? "/";
@@ -225,7 +240,7 @@ async function googleSsoPlugin(fastify: FastifyInstance, opts: GoogleSsoOptions)
       request.googleSsoUser = profile;
       return;
     }
-    return reply.redirect(`${basePath}/login`);
+    return reply.redirect(`${externalBasePath}/login`);
   });
 }
 

@@ -90,6 +90,31 @@ check("13. cookie signed with the HOST's own cookie secret is rejected too (sess
 const logoutRes = await app2.inject({ method: "GET", url: "/auth/google/logout", headers: { cookie: "google_sso_session=" + validSigned } });
 check("14. logout clears the cookie", (logoutRes.headers["set-cookie"] || "").includes("google_sso_session=;"));
 
+// --- App 3: behind a reverse proxy that strips a path prefix (e.g. Tailscale
+// Serve --set-path=/sitemap) — the exact scenario that broke the dashboard
+// earlier this session. basePath stays unprefixed (that's what this app
+// actually receives after the proxy strips it); externalBasePath carries the
+// prefix a browser-facing redirect needs. ---
+const app3 = Fastify();
+await app3.register(googleSso, {
+  clientId: CLIENT_ID,
+  clientSecret: "fake-secret",
+  callbackUri: "https://kuutraprod.tail127ff5.ts.net/sitemap/auth/google/callback",
+  sessionSecret: SESSION_SECRET,
+  basePath: "/auth/google",
+  externalBasePath: "/sitemap/auth/google",
+  successRedirect: "/sitemap/admin/dashboard",
+  isAllowed: (profile) => profile.hostedDomain === "kuutra.com",
+});
+app3.get("/admin/dashboard", { preHandler: app3.requireGoogleSession }, async () => "ok");
+
+const noCookieRes3 = await app3.inject({ method: "GET", url: "/admin/dashboard" });
+check("15. behind a stripped prefix, the login redirect carries externalBasePath", noCookieRes3.headers.location === "/sitemap/auth/google/login");
+
+const validSigned3 = sign(JSON.stringify(validPayload), SESSION_SECRET);
+const logoutRes3 = await app3.inject({ method: "GET", url: "/auth/google/logout", headers: { cookie: "google_sso_session=" + validSigned3 } });
+check("16. successRedirect after logout also carries the external prefix", logoutRes3.headers.location === "/sitemap/admin/dashboard");
+
 const failed = results.filter((r) => !r.pass);
 console.log("\n" + (results.length - failed.length) + "/" + results.length + " passed");
 process.exit(failed.length > 0 ? 1 : 0);
