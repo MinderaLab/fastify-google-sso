@@ -37,6 +37,7 @@ const loc = loginRes.headers.location || "";
 check("2. redirect goes to accounts.google.com", loc.startsWith("https://accounts.google.com/o/oauth2/v2/auth"), loc.slice(0, 60));
 check("3. redirect includes our client_id", loc.includes(encodeURIComponent(CLIENT_ID)) || loc.includes(CLIENT_ID));
 check("4. redirect requests openid scope", loc.includes("openid"));
+check("4b. redirect defaults to prompt=select_account (forces the account chooser, so a post-logout re-login is visibly fresh rather than silently auto-approved)", loc.includes("prompt=select_account"));
 
 const noCookieRes = await app1.inject({ method: "GET", url: "/admin" });
 check("5. protected route with no cookie redirects (302)", noCookieRes.statusCode === 302);
@@ -114,6 +115,19 @@ check("15. behind a stripped prefix, the login redirect carries externalBasePath
 const validSigned3 = sign(JSON.stringify(validPayload), SESSION_SECRET);
 const logoutRes3 = await app3.inject({ method: "GET", url: "/auth/google/logout", headers: { cookie: "google_sso_session=" + validSigned3 } });
 check("16. successRedirect after logout also carries the external prefix", logoutRes3.headers.location === "/sitemap/admin/dashboard");
+
+// --- App 4: prompt is overridable, not hardcoded ---
+const app4 = Fastify();
+await app4.register(googleSso, {
+  clientId: CLIENT_ID,
+  clientSecret: "fake-secret",
+  callbackUri: "http://localhost:3000/auth/google/callback",
+  sessionSecret: SESSION_SECRET,
+  prompt: "none",
+  isAllowed: () => true,
+});
+const loginRes4 = await app4.inject({ method: "GET", url: "/auth/google/login" });
+check("17. prompt is overridable (prompt: \"none\" here, not the select_account default)", (loginRes4.headers.location || "").includes("prompt=none"));
 
 const failed = results.filter((r) => !r.pass);
 console.log("\n" + (results.length - failed.length) + "/" + results.length + " passed");

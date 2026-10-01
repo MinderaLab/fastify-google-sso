@@ -88,6 +88,7 @@ since this is for a human in a browser, not a script.
 | `cookieName` | no | `google_sso_session` | |
 | `sessionTtlSeconds` | no | `43200` (12h) | |
 | `successRedirect` | no | `/` | Where the browser lands after a successful login. |
+| `prompt` | no | `select_account` | Google's own OAuth `prompt` param. The default forces the account chooser every time, even with an already-active Google session — see "Why logout needs this" below. `"consent"` also re-shows the scope consent screen; `"none"` restores silent re-auth. |
 
 `isAllowed` receives a `GoogleSsoProfile`: `{ email, name?, picture?,
 hostedDomain? }`. `hostedDomain` (Google's `hd` claim) is set only for a
@@ -116,6 +117,14 @@ need named individuals outside that domain too.
   out for now to avoid the open-redirect footgun of doing it carelessly.
 - **`@fastify/oauth2` handles CSRF protection** on the OAuth flow itself
   (the `state`/PKCE dance) — nothing extra needed from you there.
+- **Why logout needs `prompt`**: logging out only clears *this app's own*
+  session cookie — no third-party app can remotely log a browser out of
+  Google itself, by design. Without `prompt=select_account` (the default),
+  a browser with an already-active Google session would silently get a
+  fresh, valid session back the next time it's challenged to log in — no
+  interaction, no visible sign anything happened — so logout would look
+  broken even though it worked correctly. The account chooser screen is
+  what makes a fresh login visibly fresh.
 
 ## Behind a reverse proxy that strips a path prefix
 

@@ -66,6 +66,18 @@ export interface GoogleSsoOptions {
   sessionTtlSeconds?: number;
   /** Where to send the browser after a successful login. Default "/". */
   successRedirect?: string;
+  /**
+   * Google's own `prompt` OAuth parameter. Default "select_account": always
+   * show the account chooser, even if the browser already has an active
+   * Google session. Without this, logging out of *this app* (which only
+   * clears its own session cookie — no third-party app can log a browser
+   * out of Google itself) can silently re-authenticate the same account on
+   * the very next visit, since Google approves the request without asking —
+   * logout then looks like it did nothing, even though it worked correctly.
+   * "consent" is more aggressive still (re-shows the scope consent screen
+   * too); "none" restores the original silent-reauth behavior.
+   */
+  prompt?: "none" | "consent" | "select_account";
 }
 
 interface SessionPayload extends GoogleSsoProfile {
@@ -92,6 +104,7 @@ declare module "fastify" {
 const DEFAULT_BASE_PATH = "/auth/google";
 const DEFAULT_COOKIE_NAME = "google_sso_session";
 const DEFAULT_TTL_SECONDS = 12 * 60 * 60;
+const DEFAULT_PROMPT = "select_account";
 const OAUTH2_DECORATOR_NAME = "googleSsoOAuth2";
 
 // Independent of @fastify/cookie's own signed-cookie feature, deliberately:
@@ -149,6 +162,9 @@ async function googleSsoPlugin(fastify: FastifyInstance, opts: GoogleSsoOptions)
     },
     startRedirectPath: `${basePath}/login`,
     callbackUri: opts.callbackUri,
+    // Passed straight through to Google's authorize URL as extra query
+    // params (see "prompt" above for why this matters for logout).
+    callbackUriParams: { prompt: opts.prompt ?? DEFAULT_PROMPT },
   });
 
   const verifier = new OAuth2Client(opts.clientId);
