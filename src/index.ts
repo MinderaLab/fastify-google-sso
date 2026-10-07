@@ -5,6 +5,9 @@ import fastifyCookie from "@fastify/cookie";
 import { OAuth2Client } from "google-auth-library";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
+export { googleGroupChecker } from "./groups.js";
+export type { GoogleGroupChecker, GoogleGroupCheckerOptions, ServiceAccountKey } from "./groups.js";
+
 /**
  * The verified identity of whoever just logged in — everything isAllowed
  * needs to decide whether they're let in, and everything a protected route
@@ -40,8 +43,9 @@ export interface GoogleSsoOptions {
    * Decides who's actually allowed in once Google has verified their
    * identity — logging in with Google only proves *who* someone is, not
    * that they should have access. Typical implementation: check
-   * profile.hostedDomain === "yourcompany.com", or profile.email against an
-   * explicit allowlist.
+   * profile.hostedDomain === "yourcompany.com", profile.email against an
+   * explicit allowlist, or Google Group membership via googleGroupChecker.
+   * If it throws, the login is refused with a 503 and no session is set.
    */
   isAllowed: (profile: GoogleSsoProfile) => boolean | Promise<boolean>;
   /** Base path for this plugin's own routes (login/callback/logout). Default "/auth/google". */
@@ -235,7 +239,16 @@ async function googleSsoPlugin(fastify: FastifyInstance, opts: GoogleSsoOptions)
     }
 
     const profile: GoogleSsoProfile = { email: payload.email, name: payload.name, picture: payload.picture, hostedDomain: payload.hd };
-    const allowed = await opts.isAllowed(profile);
+    let allowed: boolean;
+    try {
+      allowed = await opts.isAllowed(profile);
+    } catch (err) {
+      // E.g. a group-membership lookup that Google couldn't answer. Fail
+      // closed: no session, and a 503 rather than a 403, since this isn't
+      // the user being refused — it's us not being able to decide.
+      request.log.error({ err, email: profile.email }, "google-sso: isAllowed threw");
+      return reply.code(503).type("text/plain").send("Could not check your access right now. Please try again later.");
+    }
     if (!allowed) {
       request.log.info({ email: profile.email }, "google-sso: login rejected by isAllowed");
       return reply.code(403).type("text/plain").send(`${profile.email} is not allowed to access this application.`);

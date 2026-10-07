@@ -1,7 +1,7 @@
-import { createHmac } from "node:crypto";
+import { createHmac, generateKeyPairSync } from "node:crypto";
 import Fastify from "fastify";
 import fastifyCookie from "@fastify/cookie";
-import googleSso from "../dist/index.js";
+import googleSso, { googleGroupChecker } from "../dist/index.js";
 
 const SESSION_SECRET = "test-secret-1234567890-abcdef-ghijkl";
 const CLIENT_ID = "fake-client-id.apps.googleusercontent.com";
@@ -128,6 +128,61 @@ await app4.register(googleSso, {
 });
 const loginRes4 = await app4.inject({ method: "GET", url: "/auth/google/login" });
 check("17. prompt is overridable (prompt: \"none\" here, not the select_account default)", (loginRes4.headers.location || "").includes("prompt=none"));
+
+// --- googleGroupChecker: stub fetch so the whole path runs — service-account token exchange, then the Admin SDK
+// hasMember call — without a real Google account. ---
+const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+const fakeKey = {
+  client_email: "sso-groups-reader@example.iam.gserviceaccount.com",
+  private_key: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+};
+const directoryCalls = [];
+let directoryStatus = 200;
+// gaxios (google-auth-library's HTTP layer) uses window.fetch when a window
+// exists and its own bundled node-fetch otherwise — so the stub goes there.
+globalThis.window = { fetch: async (input, init) => {
+  const url = typeof input === "string" ? input : input.url ?? String(input);
+  if (url.startsWith("https://oauth2.googleapis.com/token") || url.startsWith("https://www.googleapis.com/oauth2/v4/token")) {
+    return new Response(JSON.stringify({ access_token: "fake-access-token", expires_in: 3600, token_type: "Bearer" }), {
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (url.startsWith("https://admin.googleapis.com/admin/directory/v1/groups/")) {
+    const headers = new Headers(init?.headers);
+    directoryCalls.push({ url, authorization: headers.get("authorization") });
+    if (directoryStatus !== 200) {
+      return new Response(JSON.stringify({ error: { code: directoryStatus, message: "Not Authorized to access this resource/api" } }), {
+        status: directoryStatus,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    const isMember = decodeURIComponent(url.split("/hasMember/")[1]) === "alice@kuutra.com";
+    return new Response(JSON.stringify({ isMember }), { headers: { "content-type": "application/json" } });
+  }
+  throw new Error("unexpected fetch in test: " + url);
+} };
+try {
+  const groups = googleGroupChecker({ serviceAccountKey: fakeKey });
+  check("18. group member is reported as a member", (await groups.isMember("alice@kuutra.com", "sitemap_access@kuutra.com")) === true);
+  check("19. non-member is reported as not a member", (await groups.isMember("bob@kuutra.com", "sitemap_access@kuutra.com")) === false);
+  check(
+    "20. calls hasMember for the right group and user",
+    directoryCalls[0]?.url === "https://admin.googleapis.com/admin/directory/v1/groups/sitemap_access%40kuutra.com/hasMember/alice%40kuutra.com",
+    directoryCalls[0]?.url
+  );
+  check("21. authenticates as the service account", directoryCalls[0]?.authorization === "Bearer fake-access-token");
+
+  directoryStatus = 403;
+  let threw = false;
+  try {
+    await groups.isMember("alice@kuutra.com", "sitemap_access@kuutra.com");
+  } catch {
+    threw = true;
+  }
+  check("22. a Google API error throws instead of quietly returning false", threw);
+} finally {
+  delete globalThis.window;
+}
 
 const failed = results.filter((r) => !r.pass);
 console.log("\n" + (results.length - failed.length) + "/" + results.length + " passed");

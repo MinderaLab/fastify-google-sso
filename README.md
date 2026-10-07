@@ -2,8 +2,8 @@
 
 A drop-in Fastify plugin that gates a service's human-facing pages (an admin
 dashboard, an internal tool — anything a person opens in a browser) behind
-"Sign in with Google," restricted to a Google Workspace domain or an
-explicit email allowlist. It's deliberately narrow: it does the OAuth2 login
+"Sign in with Google," restricted to a Google Workspace domain, an
+explicit email allowlist, or Google Group membership. It's deliberately narrow: it does the OAuth2 login
 dance, verifies the ID token, checks your allow policy, and sets a signed
 session cookie. It does **not** try to be a general auth system — the
 machine-facing API of whatever service you add it to should keep using its
@@ -22,7 +22,7 @@ Pin to a tag or commit once you've settled on a version you trust, rather
 than tracking a moving branch:
 
 ```json
-"fastify-google-sso": "git+https://github.com/MinderaLab/fastify-google-sso.git#v1.0.0"
+"fastify-google-sso": "git+https://github.com/MinderaLab/fastify-google-sso.git#v1.2.0"
 ```
 
 Requires `fastify` ^5 as a peer dependency (already in your app).
@@ -82,7 +82,7 @@ since this is for a human in a browser, not a script.
 | `clientSecret` | yes | — | From Google Cloud Console. |
 | `callbackUri` | yes | — | Must exactly match an authorized redirect URI. |
 | `sessionSecret` | yes | — | Signs the session cookie. `openssl rand -hex 32`. Rotating it logs everyone out. |
-| `isAllowed` | yes | — | `(profile) => boolean \| Promise<boolean>`. Authorization, not authentication — see below. |
+| `isAllowed` | yes | — | `(profile) => boolean \| Promise<boolean>`. Authorization, not authentication — see below. If it throws, the login is refused with a 503. |
 | `basePath` | no | `/auth/google` | Where this plugin's own routes live. |
 | `externalBasePath` | no | same as `basePath` | Set this if you're behind a reverse proxy that strips a path prefix before forwarding here — see below. |
 | `cookieName` | no | `google_sso_session` | |
@@ -97,6 +97,47 @@ Restricting to a Workspace domain (`profile.hostedDomain === "kuutra.com"`)
 is usually simpler to maintain than an explicit email list, since it doesn't
 need updating as people join or leave; use an explicit list instead if you
 need named individuals outside that domain too.
+
+## Restricting access to Google Group members
+
+Signing in only proves who someone is. To let in only members of a
+Workspace group (e.g. `sitemap_access@kuutra.com`), use `googleGroupChecker`
+inside `isAllowed`:
+
+```ts
+import googleSso, { googleGroupChecker } from "fastify-google-sso";
+
+const groups = googleGroupChecker({
+  serviceAccountKey: JSON.parse(process.env.GOOGLE_SSO_SERVICE_ACCOUNT_KEY!),
+});
+
+await app.register(googleSso, {
+  // ...
+  isAllowed: async (profile) =>
+    profile.hostedDomain === "kuutra.com" &&
+    (await groups.isMember(profile.email, "sitemap_access@kuutra.com")),
+});
+```
+
+It calls the Admin SDK Directory API's `members.hasMember`, which also
+counts members of nested groups. One-time setup:
+
+1. In the Google Cloud project, enable the **Admin SDK API**.
+2. Create a service account (no project roles needed) and download a JSON
+   key for it.
+3. In the Workspace Admin console, **Account → Admin roles → Groups Reader →
+   Assign service accounts**, and add the service account's email. The
+   service account then reads groups as itself: no domain-wide delegation.
+
+One service account can serve any number of apps, each checking its own
+group.
+
+- **Fails closed.** If Google can't answer (missing role, mistyped group,
+  outage), `isMember` throws. The plugin then refuses the login with a 503
+  and logs the error. It doesn't create a session.
+- **Checked at login only.** Removing someone from the group doesn't end a
+  session they already have. It lasts up to `sessionTtlSeconds` (12h by
+  default), so lower that if access must be revoked faster.
 
 ## What this does and doesn't handle
 
