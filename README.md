@@ -3,7 +3,9 @@
 A drop-in Fastify plugin that gates a service's human-facing pages (an admin
 dashboard, an internal tool — anything a person opens in a browser) behind
 "Sign in with Google," restricted to a Google Workspace domain, an
-explicit email allowlist, or Google Group membership. It's deliberately narrow: it does the OAuth2 login
+explicit email allowlist, or Google Group membership. Services that don't use
+Fastify can use its framework-neutral core instead (see "Without Fastify"
+below). It's deliberately narrow: it does the OAuth2 login
 dance, verifies the ID token, checks your allow policy, and sets a signed
 session cookie. It does **not** try to be a general auth system — the
 machine-facing API of whatever service you add it to should keep using its
@@ -22,10 +24,12 @@ Pin to a tag or commit once you've settled on a version you trust, rather
 than tracking a moving branch:
 
 ```json
-"fastify-google-sso": "git+https://github.com/MinderaLab/fastify-google-sso.git#v1.2.0"
+"fastify-google-sso": "git+https://github.com/MinderaLab/fastify-google-sso.git#v1.3.0"
 ```
 
-Requires `fastify` ^5 as a peer dependency (already in your app).
+The Fastify plugin needs `fastify` ^5 (an optional peer dependency, already
+in your app). The core (`fastify-google-sso/core`) doesn't need Fastify at
+all.
 
 ## One-time Google Cloud setup
 
@@ -88,6 +92,7 @@ since this is for a human in a browser, not a script.
 | `cookieName` | no | `google_sso_session` | |
 | `sessionTtlSeconds` | no | `43200` (12h) | |
 | `successRedirect` | no | `/` | Where the browser lands after a successful login. |
+| `sameSite` | no | `lax` | The session cookie's `SameSite`. `"strict"` also keeps it off links followed into the app from other sites. |
 | `prompt` | no | `select_account` | Google's own OAuth `prompt` param. The default forces the account chooser every time, even with an already-active Google session — see "Why logout needs this" below. `"consent"` also re-shows the scope consent screen; `"none"` restores silent re-auth. |
 
 `isAllowed` receives a `GoogleSsoProfile`: `{ email, name?, picture?,
@@ -139,25 +144,73 @@ group.
   session they already have. It lasts up to `sessionTtlSeconds` (12h by
   default), so lower that if access must be revoked faster.
 
+## Without Fastify
+
+`fastify-google-sso/core` runs the same flow as plain functions over a
+`Cookie` request header and `Set-Cookie` response values, so any Node server
+can mount it. It takes the same options as the plugin, except `basePath` and
+`externalBasePath`, because you choose the routes yourself. From CommonJS,
+`require()` it (Node 20.19+ or 22.12+ can `require` an ES module).
+
+```js
+const http = require("node:http");
+const { createGoogleSsoCore } = require("fastify-google-sso/core");
+
+const sso = createGoogleSsoCore({
+  clientId, clientSecret, sessionSecret,
+  callbackUri: "https://app.example/auth/google/callback",
+  isAllowed: (profile) => profile.hostedDomain === "kuutra.com",
+});
+
+http.createServer(async (req, res) => {
+  const url = new URL(req.url, "http://localhost");
+  const ctx = { secure: true }; // whether the browser came in over https
+
+  if (url.pathname === "/auth/google/login") {
+    const { url: to, setCookies } = await sso.startLogin(ctx);
+    res.writeHead(302, { Location: to, "Set-Cookie": setCookies });
+    return res.end();
+  }
+  if (url.pathname === "/auth/google/callback") {
+    const result = await sso.handleCallback(url.searchParams, req.headers.cookie, ctx);
+    if (result.ok) {
+      res.writeHead(302, { Location: result.redirect, "Set-Cookie": result.setCookies });
+    } else {
+      console.warn("login refused:", result.reason, result.error ?? "");
+      res.writeHead(result.status, { "Content-Type": "text/plain", "Set-Cookie": result.setCookies });
+      res.write(result.message);
+    }
+    return res.end();
+  }
+
+  const user = sso.readSession(req.headers.cookie); // the profile, or null
+  // ...
+});
+```
+
+`sso.logoutCookies(ctx)` returns the `Set-Cookie` values that log the
+browser out.
+
 ## What this does and doesn't handle
 
-- **Session storage**: a signed, `HttpOnly`, `SameSite=Lax` cookie holding
+- **Session storage**: a signed, `HttpOnly`, `SameSite=Lax` (or `Strict`) cookie holding
   the verified profile + an expiry — no server-side session store. Fine for
   an admin tool's traffic; not built for a consumer-facing product's scale.
 - **Not encrypted, only signed**: the cookie's payload (email, name,
   picture, Workspace domain) is readable by anyone who has the cookie, just
   tamper-proof. Don't put anything more sensitive than that in a future
   version's payload without encrypting it.
-- **Coexists with your own `@fastify/cookie` usage**: if your app already
-  registers `@fastify/cookie` for something unrelated, this plugin detects
-  that and doesn't re-register it (which Fastify doesn't allow) or borrow
-  its secret — the session cookie is always signed with your own
-  `sessionSecret`, independently.
+- **Coexists with your own `@fastify/cookie` usage**: the plugin reads and
+  writes its cookies itself, so it doesn't register `@fastify/cookie` and
+  never uses its secret. The session cookie is always signed with your own
+  `sessionSecret`.
 - **No "return to the page you wanted" redirect after login** — you always
   land on `successRedirect`. A reasonable v2 addition if you need it; left
   out for now to avoid the open-redirect footgun of doing it carelessly.
-- **`@fastify/oauth2` handles CSRF protection** on the OAuth flow itself
-  (the `state`/PKCE dance) — nothing extra needed from you there.
+- **CSRF protection on the login flow itself**: a random `state` and a PKCE
+  verifier go into a signed, 10-minute `<cookieName>_login` cookie, and the
+  callback refuses anything that doesn't match it. Nothing extra is needed
+  from you there. Protecting your own state-changing routes is still your job.
 - **Why logout needs `prompt`**: logging out only clears *this app's own*
   session cookie — no third-party app can remotely log a browser out of
   Google itself, by design. Without `prompt=select_account` (the default),
