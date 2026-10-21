@@ -45,11 +45,11 @@ const STYLES = `
 :root {
   --bg: #e7f6ea;
   --card: #ffffff;
-  --text: #1e3728;
-  --muted: #6f7c74;
+  --text: #2f6544;
+  --muted: #637069;
   --accent: #ffe393;
   --accent-hover: #ffda6e;
-  --accent-text: #1e3728;
+  --accent-text: #2f6544;
   --border: rgba(30, 55, 40, 0.2);
   --error: #e66d32;
   --error-bg: #ffd6c4;
