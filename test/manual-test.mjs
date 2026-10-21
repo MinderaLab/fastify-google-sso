@@ -43,7 +43,7 @@ check("4b. redirect defaults to prompt=select_account (forces the account choose
 
 const noCookieRes = await app1.inject({ method: "GET", url: "/admin" });
 check("5. protected route with no cookie redirects (302)", noCookieRes.statusCode === 302);
-check("6. redirects to the login route", noCookieRes.headers.location === "/auth/google/login");
+check("6. redirects to the landing page", noCookieRes.headers.location === "/auth/google");
 
 // --- App 2: does the SAME app already use @fastify/cookie itself for something
 // unrelated, with its OWN secret? This is the exact scenario that broke before
@@ -112,7 +112,9 @@ await app3.register(googleSso, {
 app3.get("/admin/dashboard", { preHandler: app3.requireGoogleSession }, async () => "ok");
 
 const noCookieRes3 = await app3.inject({ method: "GET", url: "/admin/dashboard" });
-check("15. behind a stripped prefix, the login redirect carries externalBasePath", noCookieRes3.headers.location === "/sitemap/auth/google/login");
+check("15. behind a stripped prefix, the login redirect carries externalBasePath", noCookieRes3.headers.location === "/sitemap/auth/google");
+const landing3 = await app3.inject({ method: "GET", url: "/auth/google" });
+check("15b. the landing page's button points at the prefixed login route", landing3.body.includes('href="/sitemap/auth/google/login"'));
 
 const validSigned3 = sign(JSON.stringify(validPayload), SESSION_SECRET);
 const logoutRes3 = await app3.inject({ method: "GET", url: "/auth/google/logout", headers: { cookie: "google_sso_session=" + validSigned3 } });
@@ -130,6 +132,41 @@ await app4.register(googleSso, {
 });
 const loginRes4 = await app4.inject({ method: "GET", url: "/auth/google/login" });
 check("17. prompt is overridable (prompt: \"none\" here, not the select_account default)", (loginRes4.headers.location || "").includes("prompt=none"));
+
+// --- The landing page ---
+const landing1 = await app1.inject({ method: "GET", url: "/auth/google" });
+check("17a. landing page is served as HTML", landing1.statusCode === 200 && String(landing1.headers["content-type"]).startsWith("text/html") && landing1.body.includes("Sign in with Google"));
+check("17a2. landing page shows the logo inline", landing1.body.includes('class="logo" src="data:image/png;base64,'));
+check("17b. landing page opens the login in a popup", landing1.body.includes("window.open(") && landing1.body.includes("popup=1"));
+const validForApp1 = sign(JSON.stringify({ email: "alice@kuutra.com", hostedDomain: "kuutra.com", exp: Math.floor(Date.now() / 1000) + 3600 }), SESSION_SECRET);
+const landingLoggedIn = await app1.inject({ method: "GET", url: "/auth/google", headers: { cookie: "google_sso_session=" + validForApp1 } });
+check("17c. landing page sends an already logged-in browser on to successRedirect", landingLoggedIn.statusCode === 302 && landingLoggedIn.headers.location === "/");
+
+const app6 = Fastify();
+await app6.register(googleSso, {
+  clientId: CLIENT_ID,
+  clientSecret: "fake-secret",
+  callbackUri: "http://localhost:3000/auth/google/callback",
+  sessionSecret: SESSION_SECRET,
+  landingPage: { title: "Sitemap <admin>", description: "Kuutra staff only" },
+  isAllowed: () => true,
+});
+app6.get("/admin", { preHandler: app6.requireGoogleSession }, async () => "ok");
+const landing6 = await app6.inject({ method: "GET", url: "/auth/google" });
+check("17d. landing page title and description are configurable, and escaped", landing6.body.includes("<h1>Sitemap &lt;admin&gt;</h1>") && landing6.body.includes("Kuutra staff only"));
+
+const app7 = Fastify();
+await app7.register(googleSso, {
+  clientId: CLIENT_ID,
+  clientSecret: "fake-secret",
+  callbackUri: "http://localhost:3000/auth/google/callback",
+  sessionSecret: SESSION_SECRET,
+  landingPage: false,
+  isAllowed: () => true,
+});
+app7.get("/admin", { preHandler: app7.requireGoogleSession }, async () => "ok");
+check("17e. landingPage: false serves no landing page", (await app7.inject({ method: "GET", url: "/auth/google" })).statusCode === 404);
+check("17f. landingPage: false redirects gated routes straight to login", (await app7.inject({ method: "GET", url: "/admin" })).headers.location === "/auth/google/login");
 
 // --- googleGroupChecker: stub fetch so the whole path runs — service-account token exchange, then the Admin SDK
 // hasMember call — without a real Google account. ---
@@ -292,6 +329,30 @@ try {
   check("39. the session it set opens a protected route", admin5.statusCode === 200 && JSON.parse(admin5.body).user?.email === "alice@kuutra.com");
   const bad5 = await app5.inject({ method: "GET", url: "/auth/google/callback?code=c5&state=wrong", headers: { cookie: cookieHeader(loginCookies5) } });
   check("40. Fastify callback with a bad state answers 400", bad5.statusCode === 400);
+  check("40b. a non-popup login reports popup: false", ok.popup === false);
+
+  // A popup login: the callback answers with a page that reports back to the landing page
+  const popupLogin = await app5.inject({ method: "GET", url: "/auth/google/login?popup=1" });
+  const popupCookies = [].concat(popupLogin.headers["set-cookie"] || []);
+  const popupState = queryOf(popupLogin.headers.location).get("state");
+  const popupCb = await app5.inject({
+    method: "GET",
+    url: "/auth/google/callback?code=c6&state=" + encodeURIComponent(popupState),
+    headers: { cookie: cookieHeader(popupCookies) },
+  });
+  check("41. a popup callback answers 200 HTML instead of redirecting", popupCb.statusCode === 200 && String(popupCb.headers["content-type"]).startsWith("text/html"));
+  check("42. it posts the result to the opener and carries successRedirect", popupCb.body.includes("postMessage(msg, location.origin)") && popupCb.body.includes('"redirect":"/admin"'));
+  check("43. it still sets the session cookie", [].concat(popupCb.headers["set-cookie"] || []).some((c) => c.startsWith("google_sso_session=") && !c.startsWith("google_sso_session=;")));
+  const popupCancel = await app5.inject({ method: "GET", url: "/auth/google/callback?error=access_denied", headers: { cookie: cookieHeader(popupCookies) } });
+  check("44. a cancelled popup login answers 401 with an HTML page that reports the failure", popupCancel.statusCode === 401 && popupCancel.body.includes('"ok":false'));
+
+  allowedEmails = [];
+  const popupStart = await core.startLogin(ctx, { popup: true });
+  const popupRefused = await core.handleCallback(new URLSearchParams({ code: "c", state: queryOf(popupStart.url).get("state") }), cookieHeader(popupStart.setCookies), ctx);
+  const { renderPopupResult } = await import("../dist/core.js");
+  const refusedHtml = renderPopupResult({ ...popupRefused, message: "</script><script>alert(1)</script>" });
+  check("45. popup result page can't be broken out of by the message", popupRefused.popup === true && !refusedHtml.includes("</script><script>alert(1)"));
+  allowedEmails = ["alice@kuutra.com"];
 } finally {
   OAuth2Client.prototype.getToken = realGetToken;
   OAuth2Client.prototype.verifyIdToken = realVerify;

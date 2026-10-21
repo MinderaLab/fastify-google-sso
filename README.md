@@ -73,10 +73,38 @@ app.get("/admin/dashboard", { preHandler: app.requireGoogleSession }, async (req
 ```
 
 That's it — the plugin registers its own routes under `basePath` (default
-`/auth/google`): `/login` (start the flow), `/callback` (Google redirects
-here), `/logout` (clears the session). Visiting a route with
-`requireGoogleSession` while logged out redirects to `/login` — not a 401 —
-since this is for a human in a browser, not a script.
+`/auth/google`): the landing page at `basePath` itself, `/login` (start the
+flow), `/callback` (Google redirects here), `/logout` (clears the session).
+Visiting a route with `requireGoogleSession` while logged out redirects to
+the landing page — not a 401 — since this is for a human in a browser, not a
+script.
+
+## The landing page
+
+By default, `basePath` serves a small sign-in page with Kuutra's logo and colors, and a
+"Sign in with Google" button. The button opens the Google login in a popup
+window. When the popup finishes, it tells the landing page and closes, and
+the landing page moves on to `successRedirect`. If the login is refused, the
+landing page shows why. A browser that's already logged in goes straight to
+`successRedirect`.
+
+```ts
+await app.register(googleSso, {
+  // ...
+  landingPage: { title: "Sitemap admin", description: "Sign in with your Kuutra Google account." },
+});
+```
+
+- **Popups blocked, or JavaScript off**: the button is a plain link to
+  `/login`, so the login falls back to the normal full-page redirect flow.
+- **The popup reports back** over a same-origin `BroadcastChannel` and
+  `window.opener.postMessage`. If neither reaches the landing page, the popup
+  carries on to `successRedirect` itself.
+- **Inline script and style**: if your app sends a Content-Security-Policy,
+  it has to allow them on `basePath` and `/callback`, or the button falls back
+  to the full-page flow and a popup won't close itself.
+- **Turn it off** with `landingPage: false`. Logged-out browsers then go
+  straight to `/login`, as before.
 
 ## Options
 
@@ -93,6 +121,7 @@ since this is for a human in a browser, not a script.
 | `sessionTtlSeconds` | no | `43200` (12h) | |
 | `successRedirect` | no | `/` | Where the browser lands after a successful login. |
 | `sameSite` | no | `lax` | The session cookie's `SameSite`. `"strict"` also keeps it off links followed into the app from other sites. |
+| `landingPage` | no | `true` | The sign-in page at `basePath` (see above). `{ title, description }` words it for your app; `false` turns it off. |
 | `prompt` | no | `select_account` | Google's own OAuth `prompt` param. The default forces the account chooser every time, even with an already-active Google session — see "Why logout needs this" below. `"consent"` also re-shows the scope consent screen; `"none"` restores silent re-auth. |
 
 `isAllowed` receives a `GoogleSsoProfile`: `{ email, name?, picture?,
@@ -190,6 +219,12 @@ http.createServer(async (req, res) => {
 
 `sso.logoutCookies(ctx)` returns the `Set-Cookie` values that log the
 browser out.
+
+For the popup landing page, serve `renderLandingPage(loginUrl, { title })`
+as HTML, start the login with `sso.startLogin(ctx, { popup: true })` when the
+login URL has `?popup=1`, and on the callback answer a result with
+`result.popup` set with `renderPopupResult(result)` as HTML (status 200, or
+`result.status` when refused) instead of redirecting.
 
 ## What this does and doesn't handle
 

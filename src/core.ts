@@ -87,6 +87,8 @@ export interface CookieContext {
 export type CallbackResult =
   | {
       ok: true;
+      /** Whether this login was started with { popup: true }: answer with renderPopupResult(result). */
+      popup: boolean;
       profile: GoogleSsoProfile;
       /** successRedirect: where to send the browser now. */
       redirect: string;
@@ -95,6 +97,8 @@ export type CallbackResult =
     }
   | {
       ok: false;
+      /** Whether this login was started with { popup: true }: answer with renderPopupResult(result). */
+      popup: boolean;
       /** HTTP status to answer with: 400, 401, 403, 502 or 503. */
       status: number;
       /** A short plain-text message for the browser. */
@@ -108,8 +112,12 @@ export type CallbackResult =
     };
 
 export interface GoogleSsoCore {
-  /** Starts a login: redirect the browser to url, sending setCookies along. */
-  startLogin(ctx: CookieContext): Promise<{ url: string; setCookies: string[] }>;
+  /**
+   * Starts a login: redirect the browser to url, sending setCookies along.
+   * popup marks a login running in a popup window opened by the landing
+   * page, so its callback result comes back with popup: true.
+   */
+  startLogin(ctx: CookieContext, opts?: { popup?: boolean }): Promise<{ url: string; setCookies: string[] }>;
   /**
    * Finishes a login on the callback route. query is the callback request's
    * query string; cookieHeader its Cookie header.
@@ -129,6 +137,7 @@ interface SessionPayload extends GoogleSsoProfile {
 interface LoginState {
   state: string;
   verifier: string;
+  popup?: boolean;
   /** Unix seconds. */
   exp: number;
 }
@@ -229,13 +238,14 @@ export function createGoogleSsoCore(opts: GoogleSsoCoreOptions): GoogleSsoCore {
     message: string,
     reason: string,
     ctx: CookieContext,
+    popup: boolean,
     error?: unknown
   ): CallbackResult {
-    return { ok: false, status, message, reason, error, setCookies: [clearStateCookie(ctx)] };
+    return { ok: false, popup, status, message, reason, error, setCookies: [clearStateCookie(ctx)] };
   }
 
   return {
-    async startLogin(ctx) {
+    async startLogin(ctx, startOpts) {
       const state = randomBytes(16).toString("base64url");
       const { codeVerifier, codeChallenge } = await client.generateCodeVerifierAsync();
       const url = client.generateAuthUrl({
@@ -248,6 +258,7 @@ export function createGoogleSsoCore(opts: GoogleSsoCoreOptions): GoogleSsoCore {
       const payload: LoginState = {
         state,
         verifier: codeVerifier,
+        popup: startOpts?.popup === true,
         exp: Math.floor(Date.now() / 1000) + LOGIN_STATE_TTL_SECONDS,
       };
       const cookie = serializeCookie(stateCookieName, sign(JSON.stringify(payload), opts.sessionSecret), {
@@ -259,11 +270,13 @@ export function createGoogleSsoCore(opts: GoogleSsoCoreOptions): GoogleSsoCore {
     },
 
     async handleCallback(query, cookieHeader, ctx) {
+      // Read first so even a cancelled popup login answers as a popup.
+      const loginState = readSigned<LoginState>(cookieHeader, stateCookieName, opts.sessionSecret);
+      const popup = loginState?.popup === true;
       const googleError = query.get("error");
       if (googleError) {
-        return failure(401, "Login was cancelled or refused by Google.", `google: ${googleError}`, ctx);
+        return failure(401, "Login was cancelled or refused by Google.", `google: ${googleError}`, ctx, popup);
       }
-      const loginState = readSigned<LoginState>(cookieHeader, stateCookieName, opts.sessionSecret);
       const state = query.get("state");
       const code = query.get("code");
       if (
@@ -276,7 +289,7 @@ export function createGoogleSsoCore(opts: GoogleSsoCoreOptions): GoogleSsoCore {
         !safeEqual(state, loginState.state) ||
         !code
       ) {
-        return failure(400, "Login expired or was started elsewhere. Please try again.", "invalid login state", ctx);
+        return failure(400, "Login expired or was started elsewhere. Please try again.", "invalid login state", ctx, popup);
       }
 
       let idToken: string | null | undefined;
@@ -284,10 +297,10 @@ export function createGoogleSsoCore(opts: GoogleSsoCoreOptions): GoogleSsoCore {
         const { tokens } = await client.getToken({ code, codeVerifier: loginState.verifier });
         idToken = tokens.id_token;
       } catch (err) {
-        return failure(401, "Login failed.", "token exchange failed", ctx, err);
+        return failure(401, "Login failed.", "token exchange failed", ctx, popup, err);
       }
       if (!idToken) {
-        return failure(502, "Google did not return an ID token.", "no id token", ctx);
+        return failure(502, "Google did not return an ID token.", "no id token", ctx, popup);
       }
 
       let payload;
@@ -295,10 +308,10 @@ export function createGoogleSsoCore(opts: GoogleSsoCoreOptions): GoogleSsoCore {
         const ticket = await client.verifyIdToken({ idToken, audience: opts.clientId });
         payload = ticket.getPayload();
       } catch (err) {
-        return failure(401, "Could not verify Google login.", "id token verification failed", ctx, err);
+        return failure(401, "Could not verify Google login.", "id token verification failed", ctx, popup, err);
       }
       if (!payload?.email || !payload.email_verified) {
-        return failure(401, "Your Google account has no verified email address.", "no verified email", ctx);
+        return failure(401, "Your Google account has no verified email address.", "no verified email", ctx, popup);
       }
 
       const profile: GoogleSsoProfile = {
@@ -314,10 +327,10 @@ export function createGoogleSsoCore(opts: GoogleSsoCoreOptions): GoogleSsoCore {
         // E.g. a group-membership lookup that Google couldn't answer. Fail
         // closed: no session, and a 503 rather than a 403, since this isn't
         // the user being refused — it's us not being able to decide.
-        return failure(503, "Could not check your access right now. Please try again later.", "isAllowed threw", ctx, err);
+        return failure(503, "Could not check your access right now. Please try again later.", "isAllowed threw", ctx, popup, err);
       }
       if (!allowed) {
-        return failure(403, `${profile.email} is not allowed to access this application.`, "rejected by isAllowed", ctx);
+        return failure(403, `${profile.email} is not allowed to access this application.`, "rejected by isAllowed", ctx, popup);
       }
 
       const session: SessionPayload = { ...profile, exp: Math.floor(Date.now() / 1000) + ttlSeconds };
@@ -326,7 +339,7 @@ export function createGoogleSsoCore(opts: GoogleSsoCoreOptions): GoogleSsoCore {
         sameSite,
         secure: ctx.secure,
       });
-      return { ok: true, profile, redirect: successRedirect, setCookies: [sessionCookie, clearStateCookie(ctx)] };
+      return { ok: true, popup, profile, redirect: successRedirect, setCookies: [sessionCookie, clearStateCookie(ctx)] };
     },
 
     readSession(cookieHeader) {
@@ -349,5 +362,7 @@ export function createGoogleSsoCore(opts: GoogleSsoCoreOptions): GoogleSsoCore {
   };
 }
 
+export { renderLandingPage, renderPopupResult } from "./pages.js";
+export type { LandingPageOptions } from "./pages.js";
 export { googleGroupChecker } from "./groups.js";
 export type { GoogleGroupChecker, GoogleGroupCheckerOptions, ServiceAccountKey } from "./groups.js";
