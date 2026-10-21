@@ -24,7 +24,7 @@ Pin to a tag or commit once you've settled on a version you trust, rather
 than tracking a moving branch:
 
 ```json
-"fastify-google-sso": "git+https://github.com/MinderaLab/fastify-google-sso.git#v1.3.0"
+"fastify-google-sso": "git+https://github.com/MinderaLab/fastify-google-sso.git#v1.4.0"
 ```
 
 The Fastify plugin needs `fastify` ^5 (an optional peer dependency, already

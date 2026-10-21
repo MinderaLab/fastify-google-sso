@@ -1,6 +1,6 @@
 {
   "name": "fastify-google-sso",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Google login for admin/human-facing pages, restricted by a Workspace domain, an email allowlist, or Google Group membership: a drop-in Fastify plugin plus a framework-neutral core.",
   "type": "module",
   "main": "dist/index.js",
