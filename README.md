@@ -5,7 +5,8 @@ dashboard, an internal tool — anything a person opens in a browser) behind
 "Sign in with Google," restricted to a Google Workspace domain, an
 explicit email allowlist, or Google Group membership. Services that don't use
 Fastify can use its framework-neutral core instead (see "Without Fastify"
-below). It's deliberately narrow: it does the OAuth2 login
+below), and apps in any language can sit behind its standalone gate (see "The
+gate"). It's deliberately narrow: it does the OAuth2 login
 dance, verifies the ID token, checks your allow policy, and sets a signed
 session cookie. It does **not** try to be a general auth system — the
 machine-facing API of whatever service you add it to should keep using its
@@ -225,6 +226,57 @@ as HTML, start the login with `sso.startLogin(ctx, { popup: true })` when the
 login URL has `?popup=1`, and on the callback answer a result with
 `result.popup` set with `renderPopupResult(result)` as HTML (status 200, or
 `result.status` when refused) instead of redirecting.
+
+## The gate: for apps in any language
+
+`google-sso-gate` is a small reverse proxy that runs the whole login in
+front of an app that has no Google SSO of its own: Python, Next.js, anything.
+Each route listens on its own local port, in front of one app on one external
+origin. Point the proxy you already have (e.g. Tailscale Serve) at the gate
+instead of at the app:
+
+```
+browser ──► Tailscale Serve (https://sitemap-test.<tailnet>.ts.net)
+            ──► gate on 127.0.0.1:9001 ── no session → landing page → Google
+            ──► http://sitemap-test:10000
+```
+
+```bash
+npm install -g git+https://github.com/MinderaLab/fastify-google-sso.git#v1.5.0
+
+GOOGLE_CLIENT_ID=... GOOGLE_CLIENT_SECRET=... \
+GATE_SESSION_SECRET=$(openssl rand -hex 32) \
+GATE_ALLOWED_DOMAIN=kuutra.com \
+GOOGLE_SSO_SERVICE_ACCOUNT_KEY="$(cat key.json)" \
+GATE_ROUTES='[{"listen":9001,"origin":"https://sitemap-test.tail127ff5.ts.net",
+  "target":"http://sitemap-test:10000","group":"sitemap_access@kuutra.com",
+  "public":["/v1/","/mcp","/healthz"],"title":"Sitemap"}]' \
+google-sso-gate
+```
+
+From Node, `startGate()` from `fastify-google-sso/gate` takes the same
+settings as an object.
+
+- **Its own routes** are under `/_gate/auth/google`, and its cookie is
+  `kuutra_gate`. Neither collides with an app that still runs this plugin
+  itself. Each route's callback is `<origin>/_gate/auth/google/callback`;
+  add it to the OAuth client's Authorized redirect URIs.
+- **Every path needs a login except `public`**, which goes straight through
+  for the app's machine-facing API to check its own API keys. A prefix ending
+  in `/` covers everything under it; `/mcp` covers `/mcp` and `/mcp/...`, not
+  `/mcpx`. `.` and `..` segments (also as `%2e`) are resolved first, and the
+  app gets the resolved path.
+- **Who gets in**: Workspace accounts of `GATE_ALLOWED_DOMAIN`, and members
+  of the route's `group` when it has one (checked at login, as above). Each
+  route signs sessions with its own key, so a session from one gated app is
+  no good on another.
+- **Logged out**: a page view goes to the landing page and comes back to the
+  page it asked for after the login; anything else gets a 401.
+  `/_gate/auth/google/logout` signs out.
+- **It listens on 127.0.0.1 only.** Anything that can reach the app directly,
+  around the gate, isn't asked to log in. Keep the app private.
+- **The app sees the request unchanged**, minus the gate's cookies. It isn't
+  told who signed in. WebSocket upgrades aren't proxied.
 
 ## What this does and doesn't handle
 
