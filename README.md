@@ -5,7 +5,8 @@ dashboard, an internal tool — anything a person opens in a browser) behind
 "Sign in with Google," restricted to a Google Workspace domain, an
 explicit email allowlist, or Google Group membership. Services that don't use
 Fastify can use its framework-neutral core instead (see "Without Fastify"
-below). It's deliberately narrow: it does the OAuth2 login
+below), and apps in any language can sit behind its standalone gate (see "The
+gate"). It's deliberately narrow: it does the OAuth2 login
 dance, verifies the ID token, checks your allow policy, and sets a signed
 session cookie. It does **not** try to be a general auth system — the
 machine-facing API of whatever service you add it to should keep using its
@@ -225,6 +226,113 @@ as HTML, start the login with `sso.startLogin(ctx, { popup: true })` when the
 login URL has `?popup=1`, and on the callback answer a result with
 `result.popup` set with `renderPopupResult(result)` as HTML (status 200, or
 `result.status` when refused) instead of redirecting.
+
+## The gate: for apps in any language
+
+`google-sso-gate` is a small reverse proxy that runs the whole login in
+front of an app that has no Google SSO of its own: Python, Next.js, anything.
+Each route listens on its own local port, in front of one app on one external
+origin. Point the proxy you already have (e.g. Tailscale Serve) at the gate
+instead of at the app:
+
+```
+browser ──► Tailscale Serve (https://sitemap-test.<tailnet>.ts.net)
+            ──► gate on 127.0.0.1:9001 ── no session → landing page → Google
+            ──► http://sitemap-test:10000
+```
+
+```bash
+npm install -g git+https://github.com/MinderaLab/fastify-google-sso.git#v1.5.0
+
+GOOGLE_CLIENT_ID=... GOOGLE_CLIENT_SECRET=... \
+GATE_SESSION_SECRET=$(openssl rand -hex 32) \
+GATE_ALLOWED_DOMAIN=kuutra.com \
+GOOGLE_SSO_SERVICE_ACCOUNT_KEY="$(cat key.json)" \
+GATE_ROUTES='[{"listen":9001,"origin":"https://sitemap-test.tail127ff5.ts.net",
+  "target":"http://sitemap-test:10000","group":"sitemap_access@kuutra.com",
+  "public":["/v1/","/mcp","/healthz"],"title":"Sitemap"}]' \
+google-sso-gate
+```
+
+From Node, `startGate()` from `fastify-google-sso/gate` takes the same
+settings as an object.
+
+- **Its own routes** are under `/_gate/auth/google`, and its cookie is
+  `kuutra_gate`. Neither collides with an app that still runs this plugin
+  itself. Each route's callback is `<origin>/_gate/auth/google/callback`;
+  add it to the OAuth client's Authorized redirect URIs.
+- **Every path needs a login except `public`**, which goes straight through
+  for the app's machine-facing API to check its own API keys. A prefix ending
+  in `/` covers everything under it; `/mcp` covers `/mcp` and `/mcp/...`, not
+  `/mcpx`. `.` and `..` segments (also as `%2e`) are resolved first, and the
+  app gets the resolved path.
+- **`"passApiKeys": true`** also passes through any request with an
+  `Authorization: Bearer` or `X-API-Key` header, for an app whose scripts
+  send a key on the same paths as its pages. Anyone can send that header, so
+  the app must check the key on every path and refuse a wrong one, never
+  treating it as a signed-in browser.
+- **Who gets in**: Workspace accounts of `GATE_ALLOWED_DOMAIN`, and members
+  of the route's `group` when it has one (checked at login, as above). Each
+  route signs sessions with its own key, so a session from one gated app is
+  no good on another.
+- **Logged out**: a page view goes to the landing page and comes back to the
+  page it asked for after the login; anything else gets a 401.
+  `/_gate/auth/google/logout` signs out.
+- **It listens on 127.0.0.1 only.** Anything that can reach the app directly,
+  around the gate, isn't asked to log in, so have the app check the identity
+  header (below).
+- **The app sees the request unchanged**, minus the gate's cookies and any
+  `X-Gate-Identity` the client sent. WebSocket upgrades aren't proxied.
+
+### Who signed in: the X-Gate-Identity header
+
+With `GATE_SIGNING_KEY` set, every request the gate proxies for a signed-in
+browser carries `X-Gate-Identity`: a JWT signed with ES256, issuer
+`google-sso-gate`, audience the app's origin, valid for 60 seconds, with
+`email`, `name` and `hd` (the Workspace domain). The app checks it with the
+gate's public key, so a request that went around the gate, which has no valid
+header, gets nothing. Requests passed through for `public` paths or
+`passApiKeys` carry it only if the browser is signed in too.
+
+`google-sso-gate keygen` prints a new key pair: the private key goes in the
+gate's `GATE_SIGNING_KEY` (multi-line, or one line with `\n`s), the public key
+in each app. The gate also logs its public key when it starts.
+
+Each app then decides per request:
+
+1. **An API key header** (`Authorization: Bearer`, `X-API-Key`): check the
+   key, and answer 401 when it's wrong. Never fall back to anything else.
+2. **Otherwise a valid `X-Gate-Identity`**: the user is signed in.
+3. **Otherwise** answer 401, except for the route's `public` paths.
+
+Node, with `fastify-google-sso/identity` (no other dependencies):
+
+```ts
+import { verifyGateIdentity } from "fastify-google-sso/identity";
+
+const user = verifyGateIdentity(request.headers["x-gate-identity"], {
+  publicKey: process.env.GATE_PUBLIC_KEY!,
+  audience: "https://sitemap-test.tail127ff5.ts.net",
+}); // { email, name, hostedDomain } or null
+```
+
+Python, with `PyJWT[crypto]`:
+
+```python
+import jwt
+
+def gate_user(request):
+    token = request.headers.get("X-Gate-Identity")
+    if not token:
+        return None
+    try:
+        return jwt.decode(token, GATE_PUBLIC_KEY, algorithms=["ES256"], issuer="google-sso-gate",
+                          audience="https://seocrew-test.tail127ff5.ts.net", leeway=30)
+    except jwt.PyJWTError:
+        return None
+```
+
+Pin `algorithms=["ES256"]` in any library, so a token can't pick its own.
 
 ## What this does and doesn't handle
 
