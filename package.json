@@ -1,10 +1,13 @@
 {
   "name": "fastify-google-sso",
-  "version": "1.4.0",
-  "description": "Google login for admin/human-facing pages, restricted by a Workspace domain, an email allowlist, or Google Group membership: a drop-in Fastify plugin plus a framework-neutral core.",
+  "version": "1.5.0",
+  "description": "Google login for admin/human-facing pages, restricted by a Workspace domain, an email allowlist, or Google Group membership: a drop-in Fastify plugin, a framework-neutral core, and a standalone gate (reverse proxy) for apps in any language.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "google-sso-gate": "dist/gate-cli.js"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -13,6 +16,10 @@
     "./core": {
       "types": "./dist/core.d.ts",
       "default": "./dist/core.js"
+    },
+    "./gate": {
+      "types": "./dist/gate.d.ts",
+      "default": "./dist/gate.js"
     }
   },
   "files": [
