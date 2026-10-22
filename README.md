@@ -266,6 +266,11 @@ settings as an object.
   in `/` covers everything under it; `/mcp` covers `/mcp` and `/mcp/...`, not
   `/mcpx`. `.` and `..` segments (also as `%2e`) are resolved first, and the
   app gets the resolved path.
+- **`"passApiKeys": true`** also passes through any request with an
+  `Authorization: Bearer` or `X-API-Key` header, for an app whose scripts
+  send a key on the same paths as its pages. Anyone can send that header, so
+  the app must check the key on every path and refuse a wrong one, never
+  treating it as a signed-in browser.
 - **Who gets in**: Workspace accounts of `GATE_ALLOWED_DOMAIN`, and members
   of the route's `group` when it has one (checked at login, as above). Each
   route signs sessions with its own key, so a session from one gated app is

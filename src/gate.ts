@@ -16,7 +16,7 @@ import { renderLandingPage, renderPopupResult } from "./pages.js";
  *
  * Every path is gated except the route's `public` ones, which go straight
  * through: an app's machine-facing API, which keeps checking its own API
- * keys.
+ * keys. With `passApiKeys`, so does any request that carries an API key.
  */
 
 export interface GateRoute {
@@ -34,6 +34,14 @@ export interface GateRoute {
    * under it ("/mcp" matches "/mcp" and "/mcp/x", not "/mcpx").
    */
   public?: string[];
+  /**
+   * Pass requests that carry an API key (an "Authorization: Bearer" or
+   * "X-API-Key" header) through without a login, for an app whose scripts
+   * send a key on the same paths its pages use. The app must then check that
+   * key on every path, and refuse a request whose key is wrong: anyone can
+   * send the header. Default false.
+   */
+  passApiKeys?: boolean;
   /** Heading on the landing page. Default "Sign in". */
   title?: string;
 }
@@ -135,6 +143,10 @@ function send(res: http.ServerResponse, status: number, headers: http.OutgoingHt
   res.end(body);
 }
 
+function hasApiKey(req: http.IncomingMessage): boolean {
+  return /^Bearer\s+\S/i.test(req.headers.authorization ?? "") || Boolean(req.headers["x-api-key"]);
+}
+
 function wantsHtml(req: http.IncomingMessage): boolean {
   return (req.method === "GET" || req.method === "HEAD") && (req.headers.accept ?? "").includes("text/html");
 }
@@ -222,7 +234,11 @@ function createRouteHandler(route: GateRoute, core: GoogleSsoCore, log: (message
     }
 
     const pathAndQuery = `${path}${search}`;
-    if (isPublicPath(path, publicPaths) || core.readSession(req.headers.cookie)) {
+    if (
+      isPublicPath(path, publicPaths) ||
+      (route.passApiKeys === true && hasApiKey(req)) ||
+      core.readSession(req.headers.cookie)
+    ) {
       return proxy(req, res, pathAndQuery);
     }
     if (wantsHtml(req)) {

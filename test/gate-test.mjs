@@ -43,6 +43,7 @@ const gate = await startGate({
   routes: [
     { listen: 19101, origin: ORIGIN, target: `http://127.0.0.1:${upstreamPort}`, public: ["/v1/", "/mcp", "/healthz"] },
     { listen: 19102, origin: OTHER_ORIGIN, target: "http://127.0.0.1:1" },
+    { listen: 19104, origin: "https://keys-test.example.ts.net", target: `http://127.0.0.1:${upstreamPort}`, passApiKeys: true },
   ],
   log: () => {},
 });
@@ -132,6 +133,15 @@ check(
   res.status === 302 && (res.headers["set-cookie"] ?? []).some((c) => c.startsWith("kuutra_gate=;") && c.includes("Max-Age=0"))
 );
 
+res = await request("/api/runs", { headers: { authorization: "Bearer k" } });
+check("20. a Bearer key is gated without passApiKeys", res.status === 401);
+res = await request("/api/runs", { port: 19104, headers: { authorization: "Bearer k" } });
+check("21. passApiKeys passes a Bearer key through", res.status === 200 && JSON.parse(res.body).url === "/api/runs");
+res = await request("/api/runs", { port: 19104, headers: { "x-api-key": "k" } });
+check("22. ...and an X-API-Key", res.status === 200);
+res = await request("/api/runs", { port: 19104, headers: { authorization: "Basic abc", ...html } });
+check("23. ...but nothing else", res.status === 302);
+
 let refused = false;
 try {
   await startGate({
@@ -141,7 +151,7 @@ try {
 } catch {
   refused = true;
 }
-check("20. a group without a service account key refuses to start", refused);
+check("24. a group without a service account key refuses to start", refused);
 
 await gate.close();
 upstream.close();
