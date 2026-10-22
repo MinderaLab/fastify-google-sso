@@ -1,6 +1,6 @@
 {
   "name": "fastify-google-sso",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "description": "Google login for admin/human-facing pages, restricted by a Workspace domain, an email allowlist, or Google Group membership: a drop-in Fastify plugin, a framework-neutral core, and a standalone gate (reverse proxy) for apps in any language.",
   "type": "module",
   "main": "dist/index.js",
@@ -51,7 +51,7 @@
   "author": "",
   "license": "ISC",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "peerDependencies": {
     "fastify": "^5.0.0"

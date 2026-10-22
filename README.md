@@ -180,7 +180,7 @@ group.
 `Cookie` request header and `Set-Cookie` response values, so any Node server
 can mount it. It takes the same options as the plugin, except `basePath` and
 `externalBasePath`, because you choose the routes yourself. From CommonJS,
-`require()` it (Node 20.19+ or 22.12+ can `require` an ES module).
+`require()` it (Node 22.12+ can `require` an ES module).
 
 ```js
 const http = require("node:http");
