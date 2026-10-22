@@ -2,6 +2,7 @@ import { createHmac } from "node:crypto";
 import http from "node:http";
 import net from "node:net";
 import { startGate } from "../dist/gate.js";
+import { generateIdentityKeyPair, verifyGateIdentity } from "../dist/identity.js";
 
 const SESSION_SECRET = "gate-test-secret-1234567890-abcdef";
 const ORIGIN = "https://sitemap-test.example.ts.net";
@@ -23,13 +24,18 @@ function sessionCookie(origin, email = "henkka@kuutra.com") {
   return `kuutra_gate=${encodeURIComponent(sign(payload, key))}`;
 }
 
+const keys = generateIdentityKeyPair();
+const otherKeys = generateIdentityKeyPair();
+
 // The "app": echoes what reached it.
 const upstream = http.createServer((req, res) => {
   let body = "";
   req.on("data", (chunk) => (body += chunk));
   req.on("end", () => {
     res.writeHead(200, { "content-type": "application/json", "set-cookie": "app=1; Path=/" });
-    res.end(JSON.stringify({ method: req.method, url: req.url, cookie: req.headers.cookie ?? null, body }));
+    res.end(JSON.stringify({
+      method: req.method, url: req.url, cookie: req.headers.cookie ?? null, identity: req.headers["x-gate-identity"] ?? null, body,
+    }));
   });
 });
 await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
@@ -40,6 +46,7 @@ const gate = await startGate({
   clientSecret: "fake-secret",
   sessionSecret: SESSION_SECRET,
   allowedDomain: "kuutra.com",
+  signingKey: keys.privateKey,
   routes: [
     { listen: 19101, origin: ORIGIN, target: `http://127.0.0.1:${upstreamPort}`, public: ["/v1/", "/mcp", "/healthz"] },
     { listen: 19102, origin: OTHER_ORIGIN, target: "http://127.0.0.1:1" },
@@ -142,6 +149,33 @@ check("22. ...and an X-API-Key", res.status === 200);
 res = await request("/api/runs", { port: 19104, headers: { authorization: "Basic abc", ...html } });
 check("23. ...but nothing else", res.status === 302);
 
+res = await request("/admin/dashboard", { headers: { cookie: sessionCookie(ORIGIN), "x-gate-identity": "forged" } });
+const token = JSON.parse(res.body || "{}").identity;
+const who = verifyGateIdentity(token, { publicKey: keys.publicKey, audience: ORIGIN });
+check("25. a signed-in request carries a valid X-Gate-Identity", who?.email === "henkka@kuutra.com" && who?.hostedDomain === "kuutra.com");
+check("26. ...replacing the one the client sent", token !== "forged");
+check("27. it's refused for another app's origin", verifyGateIdentity(token, { publicKey: keys.publicKey, audience: OTHER_ORIGIN }) === null);
+check("28. ...and under another key", verifyGateIdentity(token, { publicKey: otherKeys.publicKey, audience: ORIGIN }) === null);
+const [h, p, sig] = token.split(".");
+const claims = JSON.parse(Buffer.from(p, "base64url").toString());
+const forged = `${h}.${Buffer.from(JSON.stringify({ ...claims, email: "evil@kuutra.com" })).toString("base64url")}.${sig}`;
+check("29. ...and when tampered with", verifyGateIdentity(forged, { publicKey: keys.publicKey, audience: ORIGIN }) === null);
+const realNow = Date.now;
+Date.now = () => realNow() + 120_000;
+check("30. ...and once expired", verifyGateIdentity(token, { publicKey: keys.publicKey, audience: ORIGIN }) === null);
+Date.now = realNow;
+
+res = await request("/v1/x", { headers: { authorization: "Bearer k", "x-gate-identity": "forged" } });
+check("31. a key-only request carries no identity, not even a forged one", JSON.parse(res.body).identity === null);
+
+let threw = false;
+try {
+  verifyGateIdentity(token, { publicKey: "not a key", audience: ORIGIN });
+} catch {
+  threw = true;
+}
+check("32. a malformed public key is an error, not a refusal", threw);
+
 let refused = false;
 try {
   await startGate({
@@ -151,7 +185,7 @@ try {
 } catch {
   refused = true;
 }
-check("24. a group without a service account key refuses to start", refused);
+check("33. a group without a service account key refuses to start", refused);
 
 await gate.close();
 upstream.close();

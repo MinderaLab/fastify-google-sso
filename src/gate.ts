@@ -1,8 +1,9 @@
 import { createHmac } from "node:crypto";
 import http from "node:http";
 import https from "node:https";
-import { createGoogleSsoCore, type CookieContext, type GoogleSsoCore } from "./core.js";
+import { createGoogleSsoCore, type CookieContext, type GoogleSsoCore, type GoogleSsoProfile } from "./core.js";
 import { googleGroupChecker, type ServiceAccountKey } from "./groups.js";
+import { createIdentitySigner, IDENTITY_HEADER } from "./identity.js";
 import { renderLandingPage, renderPopupResult } from "./pages.js";
 
 /**
@@ -17,6 +18,10 @@ import { renderLandingPage, renderPopupResult } from "./pages.js";
  * Every path is gated except the route's `public` ones, which go straight
  * through: an app's machine-facing API, which keeps checking its own API
  * keys. With `passApiKeys`, so does any request that carries an API key.
+ *
+ * With a signingKey, every request proxied for a signed-in browser carries
+ * an X-Gate-Identity header (see identity.ts) that the app can check, so it
+ * needn't trust that the request came through the gate at all.
  */
 
 export interface GateRoute {
@@ -55,6 +60,12 @@ export interface GateOptions {
   allowedDomain: string;
   /** Needed when any route has a group. */
   serviceAccountKey?: ServiceAccountKey;
+  /**
+   * An EC P-256 private key (PEM, from `google-sso-gate keygen`). When set,
+   * requests from a signed-in browser carry a signed X-Gate-Identity header
+   * for the app to check with the matching public key. Default: no header.
+   */
+  signingKey?: string;
   routes: GateRoute[];
   /** Address to listen on. Default "127.0.0.1": the gate must only be reachable through the proxy in front of it. */
   host?: string;
@@ -151,7 +162,9 @@ function wantsHtml(req: http.IncomingMessage): boolean {
   return (req.method === "GET" || req.method === "HEAD") && (req.headers.accept ?? "").includes("text/html");
 }
 
-function createRouteHandler(route: GateRoute, core: GoogleSsoCore, log: (message: string) => void) {
+type IdentitySigner = ReturnType<typeof createIdentitySigner>;
+
+function createRouteHandler(route: GateRoute, core: GoogleSsoCore, signer: IdentitySigner | null, log: (message: string) => void) {
   const target = new URL(route.target);
   const client = target.protocol === "https:" ? https : http;
   const agent = new client.Agent({ keepAlive: true });
@@ -163,11 +176,13 @@ function createRouteHandler(route: GateRoute, core: GoogleSsoCore, log: (message
   const returnCookie = (path: string, maxAge: number) =>
     `${RETURN_COOKIE}=${encodeURIComponent(path)}; Max-Age=${maxAge}; Path=/; HttpOnly; SameSite=Lax${secureAttr}`;
 
-  function proxy(req: http.IncomingMessage, res: http.ServerResponse, pathAndQuery: string): void {
+  function proxy(req: http.IncomingMessage, res: http.ServerResponse, pathAndQuery: string, profile: GoogleSsoProfile | null): void {
     const headers: http.OutgoingHttpHeaders = {};
     for (const [name, value] of Object.entries(req.headers)) {
-      if (!HOP_BY_HOP.has(name)) headers[name] = value;
+      // A client's own X-Gate-Identity never reaches the app.
+      if (!HOP_BY_HOP.has(name) && name !== IDENTITY_HEADER) headers[name] = value;
     }
+    if (signer && profile) headers[IDENTITY_HEADER] = signer.sign(profile, route.origin);
     const cookie = withoutGateCookies(req.headers.cookie);
     if (cookie === undefined) delete headers.cookie;
     else headers.cookie = cookie;
@@ -234,12 +249,9 @@ function createRouteHandler(route: GateRoute, core: GoogleSsoCore, log: (message
     }
 
     const pathAndQuery = `${path}${search}`;
-    if (
-      isPublicPath(path, publicPaths) ||
-      (route.passApiKeys === true && hasApiKey(req)) ||
-      core.readSession(req.headers.cookie)
-    ) {
-      return proxy(req, res, pathAndQuery);
+    const profile = core.readSession(req.headers.cookie);
+    if (profile || isPublicPath(path, publicPaths) || (route.passApiKeys === true && hasApiKey(req))) {
+      return proxy(req, res, pathAndQuery, profile);
     }
     if (wantsHtml(req)) {
       return send(res, 302, { location: GATE_BASE_PATH, "set-cookie": returnCookie(pathAndQuery, RETURN_TTL_SECONDS) });
@@ -256,6 +268,8 @@ export async function startGate(opts: GateOptions): Promise<Gate> {
     throw new Error("gate: a route has a group, so serviceAccountKey is required.");
   }
   const groups = opts.serviceAccountKey ? googleGroupChecker({ serviceAccountKey: opts.serviceAccountKey }) : null;
+  const signer = opts.signingKey ? createIdentitySigner(opts.signingKey) : null;
+  if (signer) log(`gate: signing X-Gate-Identity; apps check it with this public key:\n${signer.publicKey.trim()}`);
 
   const servers: http.Server[] = [];
   for (const route of opts.routes) {
@@ -275,7 +289,7 @@ export async function startGate(opts: GateOptions): Promise<Gate> {
         profile.hostedDomain === opts.allowedDomain &&
         (!route.group || (await groups!.isMember(profile.email, route.group))),
     });
-    const handle = createRouteHandler({ ...route, origin }, core, log);
+    const handle = createRouteHandler({ ...route, origin }, core, signer, log);
     const server = http.createServer((req, res) => {
       handle(req, res).catch((err) => {
         log(`gate ${origin}: ${String(err)}`);

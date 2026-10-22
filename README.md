@@ -279,9 +279,60 @@ settings as an object.
   page it asked for after the login; anything else gets a 401.
   `/_gate/auth/google/logout` signs out.
 - **It listens on 127.0.0.1 only.** Anything that can reach the app directly,
-  around the gate, isn't asked to log in. Keep the app private.
-- **The app sees the request unchanged**, minus the gate's cookies. It isn't
-  told who signed in. WebSocket upgrades aren't proxied.
+  around the gate, isn't asked to log in, so have the app check the identity
+  header (below).
+- **The app sees the request unchanged**, minus the gate's cookies and any
+  `X-Gate-Identity` the client sent. WebSocket upgrades aren't proxied.
+
+### Who signed in: the X-Gate-Identity header
+
+With `GATE_SIGNING_KEY` set, every request the gate proxies for a signed-in
+browser carries `X-Gate-Identity`: a JWT signed with ES256, issuer
+`google-sso-gate`, audience the app's origin, valid for 60 seconds, with
+`email`, `name` and `hd` (the Workspace domain). The app checks it with the
+gate's public key, so a request that went around the gate, which has no valid
+header, gets nothing. Requests passed through for `public` paths or
+`passApiKeys` carry it only if the browser is signed in too.
+
+`google-sso-gate keygen` prints a new key pair: the private key goes in the
+gate's `GATE_SIGNING_KEY` (multi-line, or one line with `\n`s), the public key
+in each app. The gate also logs its public key when it starts.
+
+Each app then decides per request:
+
+1. **An API key header** (`Authorization: Bearer`, `X-API-Key`): check the
+   key, and answer 401 when it's wrong. Never fall back to anything else.
+2. **Otherwise a valid `X-Gate-Identity`**: the user is signed in.
+3. **Otherwise** answer 401, except for the route's `public` paths.
+
+Node, with `fastify-google-sso/identity` (no other dependencies):
+
+```ts
+import { verifyGateIdentity } from "fastify-google-sso/identity";
+
+const user = verifyGateIdentity(request.headers["x-gate-identity"], {
+  publicKey: process.env.GATE_PUBLIC_KEY!,
+  audience: "https://sitemap-test.tail127ff5.ts.net",
+}); // { email, name, hostedDomain } or null
+```
+
+Python, with `PyJWT[crypto]`:
+
+```python
+import jwt
+
+def gate_user(request):
+    token = request.headers.get("X-Gate-Identity")
+    if not token:
+        return None
+    try:
+        return jwt.decode(token, GATE_PUBLIC_KEY, algorithms=["ES256"], issuer="google-sso-gate",
+                          audience="https://seocrew-test.tail127ff5.ts.net", leeway=30)
+    except jwt.PyJWTError:
+        return None
+```
+
+Pin `algorithms=["ES256"]` in any library, so a token can't pick its own.
 
 ## What this does and doesn't handle
 

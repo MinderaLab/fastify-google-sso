@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { startGate, type GateRoute } from "./gate.js";
+import { generateIdentityKeyPair } from "./identity.js";
 
 /**
  * Runs the gate from environment variables:
@@ -9,12 +10,21 @@ import { startGate, type GateRoute } from "./gate.js";
  *   GATE_ALLOWED_DOMAIN                      e.g. kuutra.com
  *   GOOGLE_SSO_SERVICE_ACCOUNT_KEY           the JSON key, when a route has a group
  *   GATE_ROUTES                              a JSON array of routes (see GateRoute)
+ *   GATE_SIGNING_KEY                         optional: signs X-Gate-Identity
+ *
+ * `google-sso-gate keygen` prints a new GATE_SIGNING_KEY and its public key.
  */
 
 function required(name: string): string {
   const value = process.env[name];
   if (!value) throw new Error(`${name} is not set.`);
   return value;
+}
+
+if (process.argv[2] === "keygen") {
+  const { privateKey, publicKey } = generateIdentityKeyPair();
+  console.log(`GATE_SIGNING_KEY (the gate only):\n${privateKey}\nPublic key (the apps):\n${publicKey}`);
+  process.exit(0);
 }
 
 try {
@@ -27,6 +37,8 @@ try {
     sessionSecret: required("GATE_SESSION_SECRET"),
     allowedDomain: required("GATE_ALLOWED_DOMAIN"),
     serviceAccountKey: key ? JSON.parse(key) : undefined,
+    // A PEM pasted as one line, with literal "\n"s, works too.
+    signingKey: process.env.GATE_SIGNING_KEY?.replace(/\\n/g, "\n") || undefined,
     routes,
   });
 } catch (err) {

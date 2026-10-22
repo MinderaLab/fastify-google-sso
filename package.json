@@ -20,6 +20,10 @@
     "./gate": {
       "types": "./dist/gate.d.ts",
       "default": "./dist/gate.js"
+    },
+    "./identity": {
+      "types": "./dist/identity.d.ts",
+      "default": "./dist/identity.js"
     }
   },
   "files": [
