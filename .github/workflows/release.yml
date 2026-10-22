@@ -1,0 +1,325 @@
+name: release
+
+# One manual workflow for the whole release lifecycle, adapted from MinderaLab/sitemap. Run it
+# from main (Actions -> release -> Run workflow).
+#
+#   cut-rc    ref (main, or release/X.Y for a hotfix) -> version X.Y.Z from package.json
+#             -> annotated tag vX.Y.Z-rc.N -> GitHub pre-release
+#   finalize  tag vX.Y.Z-rc.N -> annotated tag vX.Y.Z on the same commit + GitHub Release
+#
+# This is a library, so there is no deploy: an rc is tested by pinning it in an app that
+# uses it (e.g. "fastify-google-sso": "github:MinderaLab/fastify-google-sso#v1.6.0-rc.1", or
+# the Tailscale router's GATE_VERSION), and finalized once that works. The version is
+# package.json's, not git-cliff's: apps install by tag and npm reports package.json's
+# version, so a release starts with a PR that raises it.
+#
+# Tags and Releases are written with a token of the org GitHub App `minderalab-release`
+# (Contents: read & write), never with GITHUB_TOKEN, as in sitemap. Repository settings this
+# workflow reads:
+#   vars.RELEASE_APP_CLIENT_ID       the app's client ID
+#   secrets.RELEASE_APP_PRIVATE_KEY  one of the app's private keys (PEM)
+# See README.md, "Releasing".
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "What to do"
+        type: choice
+        options: [cut-rc, finalize]
+        required: true
+      ref:
+        description: "cut-rc only: branch to cut from (main, or release/X.Y for a hotfix)"
+        type: string
+        default: main
+      tag:
+        description: "finalize only: an existing vX.Y.Z-rc.N tag"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+# One release operation at a time, never cancelled half-way (a tag may be pushed).
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  REPO: ${{ github.repository }}
+  GIT_CLIFF: git-cliff==2.14.2
+
+jobs:
+  plan:
+    name: plan ${{ inputs.action }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      checks: read
+    outputs:
+      sha: ${{ steps.plan.outputs.sha }}
+      tag: ${{ steps.plan.outputs.tag }}
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0   # every branch and tag
+          persist-credentials: false
+
+      - name: Plan and validate
+        id: plan
+        env:
+          ACTION: ${{ inputs.action }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_TAG: ${{ inputs.tag }}
+          WORKFLOW_REF: ${{ github.ref }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_APP_CLIENT_ID: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          HAS_RELEASE_APP_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY != '' }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+
+          # The workflow files come from the dispatched ref: only main's copies may tag.
+          [[ "$WORKFLOW_REF" == refs/heads/main ]] \
+            || fail "run this workflow from main (it was dispatched from $WORKFLOW_REF)"
+
+          # Both actions end in a tag or a Release written by the minderalab-release app;
+          # refuse before anything is tagged if it is not configured.
+          [[ -n "${RELEASE_APP_CLIENT_ID:-}" ]] \
+            || fail "repository variable RELEASE_APP_CLIENT_ID (the minderalab-release app's client ID) is missing"
+          [[ "$HAS_RELEASE_APP_KEY" == true ]] \
+            || fail "repository secret RELEASE_APP_PRIVATE_KEY (the minderalab-release app's private key) is missing"
+
+          # The commit must have passed CI (the `gates` job of ci.yml).
+          gates_passed() {
+            local n
+            n=$(gh api "repos/$REPO/commits/$1/check-runs?check_name=gates&per_page=100" \
+              --jq '[.check_runs[] | select(.conclusion == "success")] | length')
+            [[ "$n" -gt 0 ]]
+          }
+          # package.json's version on commit $1, as vX.Y.Z (callers check the form).
+          package_version() {
+            echo "v$(git show "$1:package.json" | jq -r .version)"
+          }
+
+          case "$ACTION" in
+            cut-rc)
+              [[ "$INPUT_REF" =~ ^(main|release/([0-9]+)\.([0-9]+))$ ]] \
+                || fail "ref must be main or release/X.Y, got '$INPUT_REF'"
+              line_major=${BASH_REMATCH[2]:-}; line_minor=${BASH_REMATCH[3]:-}
+              sha=$(git rev-parse --verify "refs/remotes/origin/$INPUT_REF^{commit}") \
+                || fail "branch $INPUT_REF does not exist"
+              gates_passed "$sha" || fail "CI 'gates' has not passed on $sha ($INPUT_REF); wait for it or fix it"
+
+              version=$(package_version "$sha")
+              [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+                || fail "package.json on $INPUT_REF has version '${version#v}', not X.Y.Z"
+              if [[ -n "$line_major" && "$version" != "v${line_major}.${line_minor}."* ]]; then
+                fail "release/${line_major}.${line_minor} may only release v${line_major}.${line_minor}.Z, package.json has $version"
+              fi
+              git rev-parse -q --verify "refs/tags/$version" >/dev/null \
+                && fail "$version is already released: raise package.json's version in a PR first"
+
+              # Next rc number: one above the highest existing vX.Y.Z-rc.N.
+              n=0
+              while read -r t; do
+                [[ "$t" =~ ^${version//./\\.}-rc\.([0-9]+)$ ]] || continue
+                if (( BASH_REMATCH[1] > n )); then n=${BASH_REMATCH[1]}; fi
+              done < <(git tag -l "${version}-rc.*")
+              tag="${version}-rc.$((n + 1))"
+              ;;
+
+            finalize)
+              [[ "$INPUT_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]] \
+                || fail "tag must be an existing vX.Y.Z-rc.N tag, got '$INPUT_TAG'"
+              sha=$(git rev-parse -q --verify "refs/tags/$INPUT_TAG^{commit}") \
+                || fail "tag $INPUT_TAG does not exist"
+              tag="$INPUT_TAG"
+              version="${INPUT_TAG%-rc.*}"
+              [[ "$(package_version "$sha")" == "$version" ]] \
+                || fail "package.json on $INPUT_TAG ($sha) is not ${version#v}"
+              gates_passed "$sha" || fail "CI 'gates' has not passed on $INPUT_TAG ($sha)"
+              if existing=$(git rev-parse -q --verify "refs/tags/$version^{commit}"); then
+                [[ "$existing" == "$sha" ]] \
+                  || fail "$version already exists on $existing, not on $sha"
+              fi
+              ;;
+
+            *) fail "unknown action '$ACTION'" ;;
+          esac
+
+          {
+            echo "sha=$sha"
+            echo "tag=$tag"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## release plan: $ACTION"
+            echo ""
+            echo "| tag | version | commit |"
+            echo "|---|---|---|"
+            echo "| $tag | $version | \`$sha\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # cut-rc: tag the candidate and publish the pre-release.
+  tag-rc:
+    name: tag ${{ needs.plan.outputs.tag }}
+    needs: plan
+    if: inputs.action == 'cut-rc'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read   # the tag and the pre-release are written with the app token
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      SHA: ${{ needs.plan.outputs.sha }}
+    steps:
+      - name: Token of the minderalab-release app
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: MinderaLab
+          repositories: fastify-google-sso
+          permission-contents: write
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false   # the tag is pushed with the app token, below
+
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+
+      - name: Tag and publish the pre-release
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ && "$SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::bad plan output"; exit 1; }
+          # Commit identity of the app's bot user, and a push that carries the app token
+          # only in this one git process's environment (never on a command line or in
+          # .git/config; the base64 form is masked like the token itself).
+          bot="${APP_SLUG}[bot]"
+          bot_id=$(gh api "users/$bot" --jq .id)
+          git config user.name "$bot"
+          git config user.email "${bot_id}+${bot}@users.noreply.github.com"
+          push_tag() {
+            local auth
+            auth=$(printf 'x-access-token:%s' "$APP_TOKEN" | base64 -w0)
+            echo "::add-mask::$auth"
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
+              GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+              git push "https://github.com/$REPO.git" "refs/tags/$1"
+          }
+          # Re-runnable: a re-run after a failure past the push finds the tag already on this
+          # commit and only publishes what is missing.
+          if existing=$(git rev-parse -q --verify "refs/tags/$TAG^{commit}"); then
+            [[ "$existing" == "$SHA" ]] || { echo "::error::$TAG exists on $existing, not $SHA"; exit 1; }
+            echo "$TAG already tags $SHA"
+          else
+            git tag -a "$TAG" "$SHA" -m "fastify-google-sso $TAG (release candidate)"
+            push_tag "$TAG"
+          fi
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "pre-release $TAG already published"
+          else
+            uvx "$GIT_CLIFF" --unreleased --tag "$TAG" --strip header > "$RUNNER_TEMP/notes.md"
+            gh release create "$TAG" --repo "$REPO" --verify-tag --prerelease --title "$TAG" \
+              --notes-file "$RUNNER_TEMP/notes.md"
+          fi
+          {
+            echo "## $TAG"
+            echo ""
+            echo "Try it in an app: \`\"fastify-google-sso\": \"github:$REPO#$TAG\"\`, or the router's \`GATE_VERSION=$TAG\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # finalize: the final tag on the rc's commit and the GitHub Release.
+  finalize:
+    name: finalize ${{ needs.plan.outputs.version }}
+    needs: plan
+    if: inputs.action == 'finalize'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read   # the tag and the Release are written with the app token
+    env:
+      FINAL: ${{ needs.plan.outputs.version }}
+      SHA: ${{ needs.plan.outputs.sha }}
+    steps:
+      - name: Token of the minderalab-release app
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: MinderaLab
+          repositories: fastify-google-sso
+          permission-contents: write
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false   # the tag is pushed with the app token, below
+
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+
+      - name: Final tag on the same commit and the GitHub Release
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          [[ "$FINAL" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ && "$SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::bad plan output"; exit 1; }
+          bot="${APP_SLUG}[bot]"
+          bot_id=$(gh api "users/$bot" --jq .id)
+          git config user.name "$bot"
+          git config user.email "${bot_id}+${bot}@users.noreply.github.com"
+          push_tag() {
+            local auth
+            auth=$(printf 'x-access-token:%s' "$APP_TOKEN" | base64 -w0)
+            echo "::add-mask::$auth"
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
+              GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+              git push "https://github.com/$REPO.git" "refs/tags/$1"
+          }
+          if existing=$(git rev-parse -q --verify "refs/tags/$FINAL^{commit}"); then
+            # A re-run: the tag must already be here.
+            [[ "$existing" == "$SHA" ]] || { echo "::error::$FINAL exists on $existing, not $SHA"; exit 1; }
+            echo "$FINAL already tags $SHA"
+          else
+            uvx "$GIT_CLIFF" --unreleased --tag "$FINAL" --strip header > "$RUNNER_TEMP/notes.md"
+            git tag -a "$FINAL" "$SHA" -m "fastify-google-sso $FINAL"
+            push_tag "$FINAL"
+          fi
+
+          # Latest only if this is the highest final version (a hotfix on an older line must
+          # not take Latest from a newer release).
+          highest=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+          latest=false; [[ "$highest" == "$FINAL" ]] && latest=true
+
+          if gh release view "$FINAL" --repo "$REPO" >/dev/null 2>&1; then
+            if [[ "$latest" == true ]]; then gh release edit "$FINAL" --repo "$REPO" --latest; fi
+          else
+            if [[ ! -s "$RUNNER_TEMP/notes.md" ]]; then
+              # Tag existed without a Release (a re-run after a failed release step).
+              git checkout -q --detach "$SHA"
+              uvx "$GIT_CLIFF" --latest --strip header > "$RUNNER_TEMP/notes.md" || true
+            fi
+            gh release create "$FINAL" --repo "$REPO" --verify-tag --title "$FINAL" \
+              --notes-file "$RUNNER_TEMP/notes.md" --latest="$latest"
+          fi
+          {
+            echo "## released $FINAL"
+            echo ""
+            echo "commit \`$SHA\`, Latest: $latest"
+          } >> "$GITHUB_STEP_SUMMARY"

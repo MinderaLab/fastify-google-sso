@@ -386,3 +386,41 @@ layer itself, never reaching this app. `callbackUri` still needs to be the
 *full* external URL (scheme + host + prefixed path, exactly matching what's
 registered in Google Cloud Console) — `externalBasePath` is path-only, since
 a `Location` header is always resolved relative to the current origin.
+
+## Releasing
+
+Releases follow the same model as `MinderaLab/sitemap`, minus the deploy.
+Everything runs from **Actions → release → Run workflow**, with "Use workflow
+from" = `main`:
+
+1. **Raise `version` in `package.json`** in a normal PR, e.g. `1.5.0` →
+   `1.6.0`. That's the version that gets released: apps install this package
+   by tag, and npm reports `package.json`'s version, so the two must match.
+2. **cut-rc** (`ref` = `main`). Requires the CI `gates` check to have passed
+   on that commit. Tags `vX.Y.Z-rc.N` and publishes a GitHub pre-release with
+   the notes.
+3. **Try the rc in an app**: pin
+   `"fastify-google-sso": "github:MinderaLab/fastify-google-sso#v1.6.0-rc.1"`,
+   or set the Tailscale router's `GATE_VERSION=v1.6.0-rc.1`, and deploy that
+   to test.
+4. **finalize** (`tag` = that `vX.Y.Z-rc.N`). Tags `vX.Y.Z` on the same commit
+   and publishes the GitHub Release.
+
+Found a problem? Fix it on `main` with a normal PR and cut a new rc
+(`-rc.N+1`). An rc is never moved or re-tagged. If `package.json`'s version is
+already released, cut-rc refuses.
+
+The release notes ([git-cliff](https://git-cliff.org), `cliff.toml`) list the
+subject of every commit merged since the last release, leaving out the merge
+commits themselves. There is no commit or PR title convention.
+
+A hotfix on an older release: branch `release/X.Y` from its tag, raise the
+patch version and merge the fix there, and cut-rc with `ref` = `release/X.Y`.
+
+Tags and Releases are written by the org GitHub App `minderalab-release`, as
+in sitemap. The repository needs:
+
+- the app installed on this repository,
+- variable `RELEASE_APP_CLIENT_ID` and secret `RELEASE_APP_PRIVATE_KEY`,
+- a tag ruleset on `v*` that lets only admins and the app create tags,
+- `gates` as a required status check on `main`.
