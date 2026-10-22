@@ -1,0 +1,46 @@
+name: CI
+
+# Quality gates on every push and pull request. The job id `gates` is the required status
+# check, and release.yml refuses to cut a release candidate from a commit whose `gates` check
+# did not pass. Every action is pinned to a full commit SHA. Adapted from MinderaLab/sitemap.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The Node major the apps run on Render. One job, not a matrix: release.yml looks the
+      # check up by its exact name, `gates`.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+
+      # Also builds dist/, through the prepare script.
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      # The tests run against dist/, with Google's endpoints mocked: no network, no secrets.
+      - name: Test
+        run: npm test
