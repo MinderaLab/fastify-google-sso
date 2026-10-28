@@ -1,0 +1,49 @@
+# Dependabot version updates. Security updates are enabled at organization level.
+# minor + patch are grouped per ecosystem, majors come as separate PRs. A new
+# release must be a few days old before it is proposed (cooldown); security
+# updates skip the cooldown.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directories:
+      - "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Helsinki
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: ci
+      include: scope
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directories:
+      - "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Helsinki
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: chore
+      prefix-development: chore
+      include: scope
+    groups:
+      npm-dev-minor-patch:
+        dependency-type: development
+        update-types: [minor, patch]
+      npm-prod-minor-patch:
+        dependency-type: production
+        update-types: [minor, patch]
+      npm-security:
+        applies-to: security-updates
+        patterns: ["*"]
